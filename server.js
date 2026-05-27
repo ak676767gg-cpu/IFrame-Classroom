@@ -9,10 +9,8 @@ function proxyUrl(target) {
     return `${PROXY_BASE}/?url=${encodeURIComponent(target)}`;
 }
 
-function rewriteBody(body, baseUrl) {
-    const base = new URL(baseUrl);
-
-    // rewrite href and src attributes
+function rewriteHtml(body, baseUrl) {
+    // rewrite all absolute and relative URLs in HTML attributes
     body = body.replace(/(href|src|action)=["']([^"']+)["']/gi, (match, attr, val) => {
         if (val.startsWith('data:') || val.startsWith('javascript:') || val.startsWith('#') || val.startsWith('mailto:')) return match;
         try {
@@ -21,42 +19,25 @@ function rewriteBody(body, baseUrl) {
         } catch { return match; }
     });
 
-    // rewrite window.location, fetch, XMLHttpRequest urls
-    body = body.replace(/(['"`])(https?:\/\/[^'"`]+)(['"`])/g, (match, q1, u, q2) => {
-        try {
-            return `${q1}${proxyUrl(u)}${q2}`;
-        } catch { return match; }
+    // rewrite redirect locations in meta refresh
+    body = body.replace(/content=["'](\d+;\s*url=)([^"']+)["']/gi, (match, prefix, u) => {
+        try { return `content="${prefix}${proxyUrl(new URL(u, baseUrl).href)}"`; } catch { return match; }
     });
 
-    // inject base rewrite script at top of <head>
-    const inject = `
-<script>
-(function() {
-    const PROXY = ${JSON.stringify(PROXY_BASE)};
-    function pw(u) {
-        if (!u || u.startsWith('data:') || u.startsWith('javascript:') || u.startsWith('#') || u.startsWith('blob:')) return u;
-        try { return PROXY + '/?url=' + encodeURIComponent(new URL(u, location.href).href); } catch(e) { return u; }
+    // inject JS interceptor
+    const inject = `<script>
+(function(){
+    const B='${PROXY_BASE}';
+    function pw(u){
+        if(!u||u.startsWith('data:')||u.startsWith('javascript:')||u.startsWith('#')||u.startsWith('blob:'))return u;
+        try{return B+'/?url='+encodeURIComponent(new URL(u,location.href).href);}catch(e){return u;}
     }
-    // intercept fetch
-    const _fetch = window.fetch;
-    window.fetch = function(input, init) {
-        if (typeof input === 'string') input = pw(input);
-        return _fetch(input, init);
-    };
-    // intercept XHR
-    const _open = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-        return _open.call(this, method, pw(url), ...rest);
-    };
-    // intercept navigation
-    const _pushState = history.pushState;
-    history.pushState = function(state, title, url) {
-        if (url && !url.startsWith('/') && !url.startsWith('?')) url = pw(url);
-        return _pushState.call(this, state, title, url);
-    };
+    const _fetch=window.fetch;
+    window.fetch=function(input,init){if(typeof input==='string')input=pw(input);return _fetch(input,init);};
+    const _open=XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open=function(m,u,...r){return _open.call(this,m,pw(u),...r);};
 })();
 </script>`;
-
     body = body.replace(/<head([^>]*)>/i, `<head$1>${inject}`);
     return body;
 }
@@ -99,12 +80,12 @@ const server = http.createServer((req, res) => {
         delete headers['x-frame-options'];
         delete headers['content-security-policy'];
         delete headers['content-security-policy-report-only'];
+        delete headers['strict-transport-security'];
 
-        // rewrite redirect
+        // rewrite redirects
         if (headers['location']) {
             try {
-                const absolute = new URL(headers['location'], target).href;
-                headers['location'] = proxyUrl(absolute);
+                headers['location'] = proxyUrl(new URL(headers['location'], target).href);
             } catch {}
         }
 
@@ -112,17 +93,16 @@ const server = http.createServer((req, res) => {
         const isHtml = contentType.includes('text/html');
 
         if (isHtml) {
+            // only rewrite HTML — pipe everything else raw
             delete headers['content-length'];
             headers['content-type'] = 'text/html; charset=utf-8';
             res.writeHead(proxyRes.statusCode, headers);
-
             let body = '';
             proxyRes.setEncoding('utf8');
             proxyRes.on('data', chunk => body += chunk);
-            proxyRes.on('end', () => {
-                res.end(rewriteBody(body, target));
-            });
+            proxyRes.on('end', () => res.end(rewriteHtml(body, target)));
         } else {
+            // binary/CSS/JS/images — pipe raw, no touching
             res.writeHead(proxyRes.statusCode, headers);
             proxyRes.pipe(res);
         }
@@ -136,6 +116,4 @@ const server = http.createServer((req, res) => {
     req.pipe(proxyReq);
 });
 
-server.listen(PORT, () => {
-    console.log(`Proxy running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
